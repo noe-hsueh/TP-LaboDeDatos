@@ -1,0 +1,92 @@
+---
+title: "Trabajo Práctico"
+author: "Integrantes: _A completar_"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    theme: lumen
+    toc: yes
+    toc_float: yes
+subtitle: "Laboratorio de Datos"
+---
+
+# Introducción
+
+**Objetivo**: Hacer un análisis descriptivo / exploratorio con un conjunto de datos.
+
+
+**Dataset**: Aterrizajes y despegues registrados por la Empresa Argentina de Navegación Aérea (EANA). Ministerio de transporte. Detalle de aterrizajes y despegues registrados por la Empresa Argentina de Navegación Aérea. Desde enero-2014 hasta diciembre-2020.
+
+**Carga de paquetes**
+```{r}
+require(dplyr)
+require(lubridate)
+library(readr)
+require(rvest)
+require(xml2)
+```
+
+
+
+
+# Primera Parte 
+
+- El dataset tiene el código de los aeropuertos. Agreguen nuevas variables con la ciudad, provincia y coordenadas que corresponde a cada aeropuerto. Pueden encontrar esta
+información [en este artículo de Wikipedia](https://en.wikipedia.org/wiki/List_of_airports_in_Argentina).
+- Calculen la distancia recorrida por cada vuelo. La función ```distHaversine``` del paquete
+```geosphere``` puede resultarles útil.
+- Calculen la velocidad media de cada vuelo.
+- Hagan una limpieza de los datos, revisando cada una de las variables a fin de ver que no contengan errores o casos extraños
+
+```{r}
+datos <- data.frame()
+for (i in 2014:2020) {
+  nombre_archivo <- paste('dataset/aterrizajes-y-despegues-registrados-por-eana-',
+                          as.character(i), ".csv", sep="")
+  datos_i <- read.csv(nombre_archivo, fileEncoding = 'latin1' , header = T, sep = ";", strip.white = T)
+  datos   <- rbind(datos, datos_i)
+}
+datos$formato_fecha <- as.Date(datos$Fecha, format="%d/%m/%Y")
+```
+
+```{r}
+nombre_archivo_2016 <- paste('dataset/aterrizajes-y-despegues-registrados-por-eana-',
+                          as.character(2016), ".csv", sep="")
+datos_2016 <- read.csv(nombre_archivo_2016, fileEncoding = 'latin1', header = T, sep = ";", strip.white = T)
+datos_2016$Fecha <- as.Date(datos_2016$Fecha, format="%d/%m/%Y")
+
+#Wikipedia
+pag_wiki         <- read_html("https://en.wikipedia.org/wiki/List_of_airports_in_Argentina")
+elemento_tabla   <-  html_element(pag_wiki, ".wikitable")
+tabla_aeropuerto <- html_table(elemento_tabla) 
+tabla_aeropuerto$Coordinates <- tabla_aeropuerto$Coordinates %>%strsplit("/") %>% sapply("[",2)
+# Agregamos los datos adicionales
+
+info_aeropuerto <-tabla_aeropuerto %>% 
+  select(`City served`, Province, ICAO, Coordinates) %>%
+  rename(Origen.OACI = ICAO) %>% 
+  mutate(Destino.OACI = Origen.OACI)
+
+
+left_join(datos_2016, info_aeropuerto[1:4], by="Origen.OACI") %>%
+  rename(Ciudad.Origen = `City served`, Provincia.Origen = Province, Coordenada.Origen = Coordinates)
+
+left_join(datos_2016, info_aeropuerto[-3], by="Destino.OACI") %>%
+  rename(Ciudad.Destino = `City served`, Provincia.Destino = Province, Coordenada.Destino = Coordinates)
+
+```
+
+
+```{r}
+nombre_archivo_2020 <- paste('aterrizajes-y-despegues-registrados-por-eana-',
+                          as.character(2020), ".csv", sep="")
+datos_2020 <- read.csv(nombre_archivo_2020, fileEncoding = 'latin1' , header = T, sep = ";")
+datos_2020$Fecha <- as.Date(datos_2020$Fecha, format="%d/%m/%Y")
+intersect(datos_2020$Origen.OACI, datos_2020$Destino.OACI)
+```
+
+
+
+
