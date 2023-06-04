@@ -1,0 +1,963 @@
+---
+title: "Trabajo Práctico"
+author: 
+  - "Antonio, Cristian  LU: 619/14"
+  - "Hsueh, Noe LU: 546/19"
+  - "Manusovich, Pablo LU: 272/17"
+output:
+  bookdown::html_document2:
+    theme: lumen
+    df_print: paged
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+  html_notebook:
+    theme: lumen
+    toc: yes
+    toc_float: yes
+subtitle: Laboratorio de Datos
+---
+
+
+**Objetivo**: Hacer un análisis descriptivo / exploratorio con un conjunto de datos.
+
+**Dataset**: Aterrizajes y despegues registrados por la Empresa Argentina de Navegación Aérea (EANA). Ministerio de transporte. Detalle de aterrizajes y despegues registrados por la Empresa Argentina de Navegación Aérea. Desde enero-2014 hasta diciembre-2020.
+
+_Carga de paquetes_
+
+```{r warning=FALSE, message=FALSE}
+require(tidyverse)
+require(dplyr)
+require(lubridate)
+require(readr)
+require(rvest)
+require(xml2)
+require(geosphere)
+require(ggmosaic)
+require(gridExtra)
+
+# mapas
+require(ggrepel)
+require(ggplot2)
+require(tmap)
+require(sf)
+
+# grafos 
+require(igraph)
+require(ggraph)
+require(tidygraph)
+require(networkD3)
+```
+
+# Primera parte
+
+**Consigna** 
+
+- Hagan una limpieza de los datos, revisando cada una de las variables a fin de ver que no
+contengan errores o casos extraños.
+- Quedarse con vuelos nacionales.
+- El dataset tiene el código de los aeropuertos. Agreguen nuevas variables con la ciudad,
+provincia y coordenadas que corresponde a cada aeropuerto. Pueden encontrar esta
+información en este artículo de [Wikipedia](https://en.wikipedia.org/wiki/List_of_airports_in_Argentina).
+  _Observación:_ se optó por usar la base de datos ```datos_sna```, provista por la cátedra, dado que la base de wikipedia estaba incompleta.
+- Calculen la distancia recorrida por cada vuelo. La función``` distHaversine``` del paquete
+```geosphere``` puede resultarles útil.
+- Calculen la velocidad media de cada vuelo. Para esto deberán asociar distintas filas del
+dataset. El dataset contiene Despegues y Aterrizajes, que permiten encontrar la hora de
+partida y llegada de cada vuelo.
+
+
+
+----
+
+Cargamos ```datos_sna``` que contiene información georeferencial sobre los aeropuertos que se utilizarán para la primera parte del TP. Luego cargamos los datos de los vuelos del 2021. 
+
+```{r include=FALSE}
+datos_sna <- read.csv("dataset/sna_abril_2021.csv")
+datos_sna <- datos_sna %>% 
+  select(cpr, nom_ciudad, ana, x, y) %>% 
+  rename(Salida_ANA = ana) %>% 
+  mutate(Llegada_ANA = Salida_ANA)
+
+datos_2021 <- read_csv2("dataset/202109-informe-ministerio.csv") 
+datos_2021$Fecha <- ymd_hms(strptime(paste(datos_2021$Fecha, datos_2021$`Hora UTC`), format = "%d/%m/%Y %H:%M:%S"))
+datos_2021 <- datos_2021 %>% 
+  filter(`Calidad dato`=="DEFINITIVO") %>% 
+  select(-c(`Hora UTC`, `Calidad dato`))
+```
+
+Realicemos una exploración básica del dataset que se nos presentó. Esto nos ayudará a limpiar la base de datos y facilitar el análisis posterior. Empecemos analizando la variable _Clasificación de vuelo_, 
+esta nos indica si un vuelo es doméstico o si es internacional. Debido a la pandemia, es esperable que observemos muchos más vuelos
+domésticos que internacionales. A continuación presentamos una tabla con la proporciones de vuelos nacionales e internacionales. 
+
+```{r fig1, fig.cap= "Proporción de clases de vuelos durante el 2021"}
+t <- prop.table(table(datos_2021$`Clasificación Vuelo`))
+df_cv <- as.data.frame(t)
+round(t,3)
+ggplot(df_cv, aes(x=Var1, y=Freq)) + 
+  coord_flip() +
+  geom_col() +
+  xlab("Clasificación de vuelo") +
+  ylim(0,1) +
+  theme_minimal()
+```
+  A partir de la Figura \@ref(fig:fig1), notamos que son muy pocos los vuelos internacionales, tal como habíamos supuesto. 
+  
+  De los vuelos domésticos, veamos ahora cuáles son los aeropuertos con más vuelos (aterrizajes y despegue):
+```{r fig2, fig.cap= "Frquencia de vuelos por aeropuertos domésticos"}
+df_dom <- datos_2021 %>% filter(`Clasificación Vuelo`=="Dom")
+t <- prop.table(table(df_dom$Aeropuerto))
+df_aer <- as.data.frame(t)
+ggplot(df_aer, aes(x=reorder(Var1, Freq), y=Freq)) + 
+  geom_col() +
+  theme_minimal() +
+  xlab("Aeropuertos") +
+  theme(axis.text.x = element_text(size=6, angle = 90, vjust = 0.5))
+```
+
+Al observar la figura \@ref(fig:fig2), notamos que los tres aeropuertos con más vuelos son los de Morón (MOR), 
+San Fernando (FDO) y el aeroparque (AER). Sin embargo, cabe destacar que la mayorías de los vuelos que salen o entran 
+a los aeropuertos de Morón y San Fernando pertenecen a vuelos no regulares, es decir, aquellos que están etiquetados
+como no regular, vuelos privados, vuelos escuela, entre otros. Para nuestro análisis de velocidad media vamos a
+considerar solamente los vuelos regulares, razón por la cual estos datos serán descartado para el análisis. 
+
+```{r}
+datos_2021 %>% 
+  filter(Aeropuerto=="MOR"| `Origen / Destino`=="MOR" | Aeropuerto=="FDO" | `Origen / Destino`=="FDO") %>% 
+  group_by(`Clase de Vuelo (todos los vuelos)`) %>%
+  count(sort=T)
+```
+
+Luego procedimos a una primera limpieza de la base de datos. Nos quedaremos con los vuelos domésticos, de tipo regular 
+y aquellas que tengan un nombre de aerolínea. Por otra parte, agregamos una columna que corresponde a la distancia recorrida ```dist_rec_km``` en km. 
+```{r}
+datos_2021 <- datos_2021 %>% 
+  filter(`Clasificación Vuelo`=="Dom",
+         `Clase de Vuelo (todos los vuelos)`=="Regular", 
+         `Aerolinea Nombre`!= 0) %>% 
+  select(-c(`Clasificación Vuelo`)) %>% 
+  rename(Salida_ANA = Aeropuerto,
+         Llegada_ANA = `Origen / Destino`) 
+
+datos_2021 <- left_join(datos_2021, datos_sna[-6], by="Salida_ANA") %>%
+  rename(Ciudad.Origen = nom_ciudad, Provincia.Origen = cpr, lat_origen = x, lon_origen = y)
+
+datos_2021 <- left_join(datos_2021, datos_sna[-3], by="Llegada_ANA") %>%
+  rename(Ciudad.Destino = nom_ciudad, Provincia.Destino = cpr, lat_destino=x, lon_destino=y)
+
+datos_2021 <- datos_2021 %>% 
+  mutate(dist_rec_km = round(distHaversine(p1=cbind(lon_origen, lat_origen),
+                                           p2=cbind(lon_destino, lat_destino))/1000)) 
+
+```
+
+Dividimos la base de datos original en dos, una de despegue y otra de aterrizaje, esto nos permitirá hacer
+un matcheo de la gran parte de los vuelos y así obtener el tiempo de vuelo. 
+
+```{r include=FALSE}
+despegues  <- datos_2021 %>% 
+  filter(`Tipo de Movimiento` == "Despegue", !is.na(dist_rec_km)) %>% 
+  select(-c(`Tipo de Movimiento`))
+
+aterrizajes <- datos_2021 %>% 
+  filter(`Tipo de Movimiento` == "Aterrizaje", !is.na(dist_rec_km)) %>% 
+  select(-c(`Tipo de Movimiento`)) 
+
+aterrizajes <- aterrizajes[-c(1:4),] # estos vuelos despegaron el año pasado
+
+aterrizajes <- aterrizajes %>% 
+  select(c(Fecha, Salida_ANA, Llegada_ANA, `Aerolinea Nombre`, Aeronave))
+
+matched     <- left_join(despegues, aterrizajes, 
+                      by= c("Salida_ANA" = "Llegada_ANA", 
+                            "Llegada_ANA" = "Salida_ANA", 
+                            "Aerolinea Nombre" = "Aerolinea Nombre", 
+                            "Aeronave" = "Aeronave")) %>% 
+  mutate(tdif = as.numeric(Fecha.y - Fecha.x, units='hours')) %>%
+  group_by(Salida_ANA, Fecha.x, Aeronave, `Aerolinea Nombre`) %>% 
+  filter(tdif > 0) %>%
+  filter(tdif < 5) %>% 
+  filter(tdif == min(tdif))
+
+df_tiempoDeVuelo <- matched %>% 
+  group_by(Salida_ANA, Llegada_ANA) %>%  
+  summarize(mediana_tiempoDeVuelo=median(tdif), n=n()) %>% 
+  arrange(desc(n))
+
+df_distanciaDeVuelo <- matched %>% 
+  group_by(Salida_ANA, Llegada_ANA) %>%  
+  summarize(dist=median(dist_rec_km), n=n()) %>% 
+  arrange(desc(n)) %>% 
+  select(-c(n))
+
+info_vuelos <- left_join(df_distanciaDeVuelo, df_tiempoDeVuelo, by=c("Salida_ANA", "Llegada_ANA")) %>% 
+  mutate(velocidad_de_vuelo_kmH = dist/mediana_tiempoDeVuelo) %>% 
+  filter(velocidad_de_vuelo_kmH > 0, velocidad_de_vuelo_kmH <1000)
+
+```
+
+En la tabla ```info_vuelos```, calculamos para los vuelos matcheados la distancia recorrida, le mediana del tiempo de vuelo y la velocidad media del vuelo. En el ejemplo que vemos abajo, vemos que de EZE (Ezeiza) a BAR (Bariloche), 
+la distancia recorrida es de 1434 km, la mediana del tiempo de vuelo es de casi 2 horas (1.88) y con esto estimamos
+que la velocidad media de vuelo es aproximadamente de 761 km/h. 
+
+```{r, echo = FALSE}
+head(info_vuelos)
+```
+Para poder entender mejor los resultados que obtuvimos, realizamos un resumen estadístico y un boxplot: 
+```{r}
+summary(info_vuelos$velocidad_de_vuelo_kmH)
+```
+
+```{r fig3, fig.cap="Boxplot velocidad de vuelo en km x hr"}
+boxplot(info_vuelos$velocidad_de_vuelo_kmH, ylab="Velocidad de vuelo en km x hr", main="Boxplot de velocidades de vuelos")
+abline(h = mean(info_vuelos$velocidad_de_vuelo_kmH), col='orange')
+```
+
+A partir de la figura \@ref(fig:fig3), vemos que la mediana de las velocidades es de 481 km/h y la mayor parte de los vuelos vuelan con una velocidad de entre 344 km/h y 621 km/h. 
+
+
+---
+
+# Segunda parte
+
+**Consigna** 
+
+-   Usando las herramientas que aprendieron, exploren los datos. Piensen preguntas que les despierten interés y generen hipótesis que den posibles respuestas, en base a las magnitudes y visualizaciones que vimos en clase.
+
+-   Reporten las preguntas que se hicieron y las hipótesis que generaron, buscando construir una narrativa. Es necesario mezclar texto, código y visualizaciones.
+
+_Sugerencia para la Parte 2:_ Tomen cada variable y piensen qué información les brinda, cómo la representarían y resumirían. Luego, tomen cada par de variables posibles y piensen qué relación se obtiene de ellas. Tomen las que les resulten más interesantes, resumanlas y representenlas.
+
+----
+## Introducción 
+La motivación del presente trabajo parte de la información preexistente por parte de los integrantes de este grupo de que durante el lapso 2015 y 2019 tuvieron lugar cierto fenómenos en el mundo aerocomercial argentino (inauguración de aeropuertos, surgimiento de empresas de vuelos low-cost, diversificación del mercado de vuelos) que estarían reflejando un proceso de cambio que sería razonable poder abordarlo y cuantificarlo haciendo uso de los datos provistos. 
+
+Veamos que cómo evolucionaron los vuelos entre los años 2015 y 2019:
+```{r figxanio, fig.cap="Cantidad de vuelos por año"}
+vuelos_por_anio <- data.frame()
+for (i in 2015:2020) {
+  nombre_archivo <- paste('dataset/aterrizajes-y-despegues-registrados-por-eana-',
+                          as.character(i), ".csv", sep="")
+  datos_i <- read.csv(nombre_archivo, fileEncoding = 'latin1' , header = T, sep = ";", strip.white = T)
+  cant_vuelos_i <- datos_i %>% 
+    filter(Clasificación.Vuelo!="Internacional", 
+         Clase.de.Vuelo=="Regular",
+         Tipo.de.Movimiento == "Despegue",
+         Aerolinea.Nombre!= "N/A") %>% 
+    drop_na() %>% 
+    count() %>% 
+    mutate(anio=i)
+  vuelos_por_anio <- rbind(vuelos_por_anio, cant_vuelos_i)
+}
+
+ggplot(vuelos_por_anio, aes(x=as.factor(anio), y=n)) +
+  geom_bar(stat='identity', position='dodge') +
+  ggtitle("Cantidad de vuelos por año") +
+  xlab("")+
+  ylab("Cantidad de Vuelo") +
+  theme_minimal()
+
+```
+
+A partir de la figura \@ref(fig:figxanio), notamos que el crecimiento de los vuelos se dio año tras año, la diferencia más notable fue durante el 2015 y 2019, por lo que centraremos nuestro análisis en estos
+dos años. Cabe destacar que el descenso en vuelos que se observa en el 2020 fue por la pandemia. 
+
+Nos hemos propuesto a analizar los cambios en los vuelos de los años 2015 y 2019 y estudiar los cambios en el mapa de los vuelos comerciales que tuvieron lugar en nuestro país. Para ello, comenzamos comparando la cantidad de vuelos en dichos años, las empresas más relevantes que lo llevaron a cabo y las regiones geográficas que tuvieron como destino dicho vuelo. Esto nos permitirá verificar si la hipótesis de los cambios que tuvieron lugar en dicho periodo es confirmado con los datasets proporcionados. 
+
+Para el estudio, tendremos en cuenta los siguientes puntos:
+
+1. la cantidad de vuelo en el 2015 y 2019
+2. el conexiones de los vuelos en el 2015 y 2019 
+3. las aerolíneas que llevaron a cabo esos vuelos. 
+
+Nos enfocarnos en varios niveles de profundidad: en el aspecto nacional, regional o provincial y local.
+
+**Carga de información**
+
+Primero, cargamos los datos de [esta tabla proveniente de  wikipedia](https://en.wikipedia.org/wiki/List_of_airports_in_Argentina), que contiene información relacionado a los aeropuertos.
+
+```{r}
+#Wikipedia
+pag_wiki <- read_html("https://en.wikipedia.org/wiki/List_of_airports_in_Argentina")
+elemento_tabla   <-  html_element(pag_wiki, ".wikitable")
+tabla_aeropuerto <- html_table(elemento_tabla) 
+tabla_aeropuerto$Coordinates <- tabla_aeropuerto$Coordinates %>%strsplit("/") %>% sapply("[",2)
+
+# Agregamos los datos adicionales a 
+# Info Aeropuertos
+info_aeropuerto <- tabla_aeropuerto %>% 
+  select(`City served`, Province, ICAO, Coordinates) %>%
+  rename(Origen.OACI = ICAO) %>% 
+  mutate(Destino.OACI = Origen.OACI)
+
+# Renombramos el nombre de algunas ciudades/zona 
+info_aeropuerto <- info_aeropuerto %>% 
+  mutate(`City served` = case_when(
+    `City served`=="Buenos Aires metropolitan area" ~ "AMBA", 
+    `City served`=="Catamarca (San Fernando del Valle de Catamarca)" ~ "Catamarca", 
+    `City served`=="Jujuy (San Salvador de Jujuy)" ~ "Jujuy", 
+    `City served`=="Tucumán (San Miguel de Tucumán)" ~ "Tucumán", 
+    `City served`=="San Fernando (San Fernando de la Buena Vista)" ~ "San Fernando", 
+    TRUE ~ `City served`,
+  ))
+
+```
+
+
+A continuación cargamos los datos de vuelos y los pre-procesamos efectuando su limpieza, supresión de NAs, adecuación
+de fechas, unificación, renombramiento de algunas variables y solución de inconsistencias. Más aún, filtramos en estas bases de datos los vuelos nacionales y los vuelos regulares, ya que nuestro análisis se centrará solamente en estas categorías de vuelos. Tomamos la decisión de trabajar solamente con los despegues considerando que para cada vuelo que despega, también aterriza. De esta manera, la base de datos no quedará con vuelos redundantes. 
+
+_2019_
+```{r}
+nombre_archivo_2019 <- paste('dataset/aterrizajes-y-despegues-registrados-por-eana-',
+                          as.character(2019), ".csv", sep="")
+datos_2019 <- read.csv(nombre_archivo_2019, fileEncoding = 'latin1', 
+                       header = T, sep = ";", strip.white = T)
+datos_2019$Fecha <- as.Date(datos_2019$Fecha, format="%d/%m/%Y")
+
+# Agregado de datos referidos a los aeropuertos
+datos_2019 <- left_join(datos_2019, info_aeropuerto[1:4], by="Origen.OACI") %>%
+  rename(Ciudad.Origen = `City served`, Provincia.Origen = Province, Coordenada.Origen = Coordinates)
+
+datos_2019 <- left_join(datos_2019, info_aeropuerto[-3], by="Destino.OACI") %>%
+  rename(Ciudad.Destino = `City served`, Provincia.Destino = Province, Coordenada.Destino = Coordinates)
+
+# Limpieza de las coordenadas, nos quedamos con las coordenadas en decimales
+datos_2019 <- datos_2019 %>% 
+  separate(col=Coordenada.Origen, into=c("lat_origen", "lon_origen"), sep = 'S', remove = T) %>% 
+  mutate(lat_origen = -as.numeric(gsub('[^0-9.]', "", lat_origen)), 
+         lon_origen = -as.numeric(gsub('[^0-9.]', "", lon_origen))) %>% 
+  separate(col=Coordenada.Destino, into=c("lat_destino", "lon_destino"), sep = 'S', remove = T) %>% 
+  mutate(lat_destino = -as.numeric(gsub('[^0-9.]', "", lat_destino)), 
+         lon_destino = -as.numeric(gsub('[^0-9.]', "", lon_destino)))
+
+# Filtro de datos y unifiación de nombres
+datos_2019 <- datos_2019 %>% 
+  filter(Clasificación.Vuelo!="Internacional", 
+         Clase.de.Vuelo=="Regular", 
+         Destino.OACI != "N/A", 
+         Origen.OACI != "AR-0", 
+         Aerolinea.Nombre!= "N/A", 
+         Tipo.de.Movimiento == "Despegue") %>% 
+  mutate(Aerolinea.Nombre = case_when(
+    str_detect(Aerolinea.Nombre, "LATAM") ~ "LATAM",
+    str_detect(Aerolinea.Nombre, "LADE") ~ "LADE",
+    str_detect(Aerolinea.Nombre, "Norwegian") ~ "Norwegian",
+    str_detect(Aerolinea.Nombre, "Gol") ~ "Gol",
+    str_detect(Aerolinea.Nombre, "Azul") ~ "Azul Linhas Aéreas",
+    TRUE ~ Aerolinea.Nombre)) %>% 
+  drop_na() %>% 
+  select(-c(Clasificación.Vuelo, Clase.de.Vuelo, Tipo.de.Movimiento, Aeronave))
+
+```
+
+
+
+_2015_
+
+```{r}
+nombre_archivo_2015 <- paste('dataset/aterrizajes-y-despegues-registrados-por-eana-', as.character(2015), ".csv", sep="")
+datos_2015 <- read.csv(nombre_archivo_2015, fileEncoding = 'latin1', 
+                       header = T, sep = ";", strip.white = T)
+datos_2015$Fecha <- as.Date(datos_2015$Fecha, format="%d/%m/%Y")
+
+datos_2015 <- left_join(datos_2015, info_aeropuerto[1:4], by="Origen.OACI") %>%
+  rename(Ciudad.Origen = `City served`, 
+         Provincia.Origen = Province, 
+         Coordenada.Origen = Coordinates)
+
+datos_2015 <- left_join(datos_2015, info_aeropuerto[-3], by="Destino.OACI") %>%
+  rename(Ciudad.Destino = `City served`, 
+         Provincia.Destino = Province, 
+         Coordenada.Destino = Coordinates)
+
+datos_2015 <- datos_2015 %>% 
+  separate(col=Coordenada.Origen, into=c("lat_origen", "lon_origen"), sep = 'S', remove = T) %>% 
+  mutate(lat_origen = -as.numeric(gsub('[^0-9.]', "", lat_origen)), 
+         lon_origen = -as.numeric(gsub('[^0-9.]', "", lon_origen))) %>% 
+  separate(col=Coordenada.Destino, into=c("lat_destino", "lon_destino"), sep = 'S', remove = T) %>% 
+  mutate(lat_destino = -as.numeric(gsub('[^0-9.]', "", lat_destino)), 
+         lon_destino = -as.numeric(gsub('[^0-9.]', "", lon_destino)))
+
+datos_2015 <- datos_2015 %>% 
+  filter(Clasificación.Vuelo!="Internacional", 
+          Clase.de.Vuelo=="Regular",
+          Destino.OACI != "N/A", 
+         Origen.OACI != "AR-0",
+         Aerolinea.Nombre!= "N/A",
+         Tipo.de.Movimiento == "Despegue")  %>% 
+  mutate(Aerolinea.Nombre = case_when(
+    str_detect(Aerolinea.Nombre, "LATAM") ~ "LATAM",
+    str_detect(Aerolinea.Nombre, "LADE") ~ "LADE",
+    TRUE ~ Aerolinea.Nombre)) %>% 
+  drop_na() %>% 
+  select(-c(Clasificación.Vuelo, Clase.de.Vuelo, Tipo.de.Movimiento, Aeronave))
+```
+
+Guardamos en ```datos_2019``` y ```datos_2015``` la información referida a los vuelos regulares y domésticos. 
+
+## Vuelos a nivel nacional
+
+Veamos las rutas de vuelos realizadas en los dos años que estudiaremos:
+
+```{r fig.height=6, fig.width=4}
+v_2015 <- datos_2015 %>% 
+  select(Ciudad.Origen, Ciudad.Destino, lat_origen, lon_origen, lat_destino, lon_destino) %>% 
+  filter(lat_origen != lat_destino) %>% 
+  distinct() %>% 
+  drop_na() %>% 
+  mutate(anio="2015") %>% 
+  as_tibble() 
+
+v_2019 <- datos_2019 %>% 
+  select(Ciudad.Origen, Ciudad.Destino, lat_origen, lon_origen, lat_destino, lon_destino) %>% 
+  filter(lat_origen != lat_destino) %>% 
+  distinct() %>% 
+  drop_na() %>% 
+  mutate(anio="2019") %>% 
+  as_tibble() 
+
+v_tot <- rbind(v_2015, v_2019)
+
+mapa_arg <- ggplot() +
+  borders(database = "world", regions = c("argentina"), fill = 'grey13') 
+
+mapa_arg +
+  geom_point(data=v_tot, 
+             aes(x=lon_origen, y=lat_origen), 
+             size=.3, 
+             col="chocolate1") +
+  geom_point(data=v_tot, 
+             aes(x=lon_destino, y=lat_destino),
+             size=.3, 
+             col="chocolate1") +
+  geom_curve(data = v_tot, 
+             aes(x= lon_origen, y=lat_origen, xend=lon_destino, yend=lat_destino, col=anio),
+             size=.1,
+             curvature=.06) +
+  labs(col="año") +
+  theme_void()
+```
+
+**Todos los caminos conducen a Buenos Aires.** En la figura superior notamos que los vuelos en ambos años conducen a Buenos Aires, un hecho esperable dado que histórica y políticamente es la ciudad más importante. También percibimos que en el 2019, hubo un aumento de los vuelos a Córdoba y también la inaguración y desaparición de otras rutas aéreas.
+
+Ahora, surge naturalmente la duda de saber cuántos vuelos hubo en cada año:
+
+```{r figCantVuelos, fig.cap="Cantidad de vuelos en el 2015 y 2019"}
+cant_vuelos_2015 <-  datos_2015 %>% 
+  count(sort=T) %>% 
+  mutate(anio = "2015" )
+
+cant_vuelos_2019 <-  datos_2019 %>% 
+  count(sort=T) %>% 
+  mutate(anio = "2019" )
+
+cant_vuelos_totales <- rbind(cant_vuelos_2015, cant_vuelos_2019) 
+
+ggplot(cant_vuelos_totales, aes(x= anio, y=n)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_minimal() +
+  ylab("Cantidad de vuelos") +
+  xlab("") +
+  ggtitle("Cantidad de vuelos en el 2015 y 2019") +
+   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), plot.title = element_text(hjust = 0.5)) 
+```
+A partir de la Figura \@ref(fig:figCantVuelos), notamos un gran aumento de la cantidad de vuelos entre el 2015 y 2019. Lo cual nos sugiere, en línea con nuestra hipótesis inicial, que el mercado aerocomercial ha sufrido un importante cambio, ya que la frecuencia de estos se han incrementado significativamente. Naturalmente, surge la pregunta de si este aumento se refleja también a nivel regional. 
+
+## Vuelos a nivel regional
+
+Consideramos útil, a los efectos de nuestro trabajo, la división del territorio nacional en cinco regiones principales: 
+Cuyo, Buenos Aires, Patagonia, Norte y Centro, según el siguiente mapa.  Para ello, agregamos una columna con la información a la región.
+
+<center>
+![Mapa de regiones](/Users/noehsueh/UBA/LaboDeDatos/TP-LDD/imagenes/regiones.png)
+</center>
+
+```{r}
+vec_norte <- c("Salta", "Formosa", "Tucumán", "Chaco", "Jujuy", 
+          "Misiones", "Catamarca", "Corrientes", "Santiago del Estero")
+datos_2019 <- datos_2019 %>% 
+   mutate(Region.Origen = case_when(
+    Provincia.Origen %in% c("San Juan", "Mendoza", "La Rioja", "San Luis") ~ "Cuyo",
+    Provincia.Origen ==     "Buenos Aires" ~ "Buenos Aires",       
+    Provincia.Origen %in% c("Chubut", "Río Negro", "Santa Cruz", "Tierra del Fuego",
+                            "Neuquén", "La Pampa") ~ "Patagonia",
+    Provincia.Origen %in% vec_norte~ "Norte",    
+    Provincia.Origen %in% c("Córdoba", "Santa Fe", "Entre Ríos") ~ "Centro"),
+    Region.Destino = case_when(
+    Provincia.Destino %in% c("San Juan", "Mendoza", "La Rioja", "San Luis") ~ "Cuyo",
+    Provincia.Destino ==     "Buenos Aires" ~ "Buenos Aires",       
+    Provincia.Destino %in% c("Chubut", "Río Negro", "Santa Cruz", "Tierra del Fuego",
+                            "Neuquén", "La Pampa") ~ "Patagonia",
+    Provincia.Destino %in% c("Salta", "Formosa", "Tucumán", "Chaco", "Jujuy", 
+                             "Misiones", "Catamarca", "Corrientes", "Santiago del Estero")~ "Norte",    
+    Provincia.Destino %in% c("Córdoba", "Santa Fe", "Entre Ríos") ~ "Centro"))
+
+
+datos_2015 <- datos_2015 %>% 
+   mutate(Region.Origen = case_when(
+    Provincia.Origen %in% c("San Juan", "Mendoza", "La Rioja", "San Luis") ~ "Cuyo",
+    Provincia.Origen ==     "Buenos Aires" ~ "Buenos Aires",       
+    Provincia.Origen %in% c("Chubut", "Río Negro", "Santa Cruz", "Tierra del Fuego",
+                            "Neuquén", "La Pampa") ~ "Patagonia",
+    Provincia.Origen %in% c("Salta", "Formosa", "Tucumán", "Chaco", "Jujuy", 
+                            "Misiones", "Catamarca", "Corrientes", "Santiago del Estero")~ "Norte",    
+    Provincia.Origen %in% c("Córdoba", "Santa Fe", "Entre Ríos") ~ "Centro"),
+    Region.Destino = case_when(
+    Provincia.Destino %in% c("San Juan", "Mendoza", "La Rioja", "San Luis") ~ "Cuyo",
+    Provincia.Destino ==     "Buenos Aires" ~ "Buenos Aires",       
+    Provincia.Destino %in% c("Chubut", "Río Negro", "Santa Cruz", "Tierra del Fuego",
+                            "Neuquén", "La Pampa") ~ "Patagonia",
+    Provincia.Destino %in% c("Salta", "Formosa", "Tucumán", "Chaco", "Jujuy", 
+                             "Misiones", "Catamarca", "Corrientes", "Santiago del Estero")~ "Norte",    
+    Provincia.Destino %in% c("Córdoba", "Santa Fe", "Entre Ríos") ~ "Centro"))
+
+```
+
+
+```{r figXRegion, fig.cap="Cantidad de vuelos por región en el 2015 y 2019"}
+cant_vxRegion_2015 <-  datos_2015 %>% 
+  group_by(Region.Origen) %>% 
+  count(sort=T) %>% 
+  mutate(anio = "2015" )
+
+cant_vxRegion_2019 <-  datos_2019 %>% 
+  group_by(Region.Origen) %>% 
+  count(sort=T) %>% 
+  mutate(anio = "2019" )
+
+cant_vxRegion <- rbind(cant_vxRegion_2015, cant_vxRegion_2019) 
+
+ggplot(cant_vxRegion, aes(x=reorder(Region.Origen,-n), y=n, fill=anio)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_minimal() +
+  ylab("Cantidad de vuelos") +
+  xlab("") +
+  labs(fill = "año") +
+  ggtitle("Cantidad de vuelos por región en el 2015 y 2019") +
+   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), plot.title = element_text(hjust = 0.5)) 
+```
+A observar la figura \@ref(fig:figXRegion), notamos un incremento en la cantidad de los vuelos en todas las regiones. Veamos a continuación cuánto es este aumento. Realizamos entonces una tabla con la diferencia porcentual. 
+
+```{r}
+t_2015 <- cant_vxRegion_2015 %>% 
+  select(-c(anio)) %>% 
+  rename(vuelos_2015 = n)
+
+t_2019 <- cant_vxRegion_2019 %>% 
+  select(-c(anio)) %>% 
+  rename(vuelos_2019 =n)
+
+t_dif_regiones <- left_join(t_2015, t_2019, by="Region.Origen") %>% 
+  mutate(dif_porcentual = (vuelos_2019 - vuelos_2015)/vuelos_2015 * 100, 
+         dif_porcentual = round(dif_porcentual)) %>% 
+  arrange(desc(dif_porcentual)) 
+t_dif_regiones
+```
+Notamos en esta tabla que la región Centro (Córdoba, Santa Fe y Entre Ríos) y la región Norte (Misiones, Corrientes, Chaco, Formosa, Tucumán, La Rioja, Jujuy, Salta y Santiago del Estero) tuvieron un aumento superior al 80%. Nos llama la atención que provincias tan postergadas económicamente hayan sido aquellas que tuvieron un aumento mayor en la cantidades de vuelos. Por otra parte, Buenos Aires y la Patagonia tuvieron menor aumento relativo en la cantidad de vuelo, con aumentos inferiores a las previamente mencionadas. 
+
+A partir de estos datos, nos preguntamos cómo fue ese cambio en la región Norte, si fue uniforme en todas las provincias o si hubo algunas que se destacaron por sobre las otras. 
+
+## Vuelos a nivel provincial y local
+
+```{r}
+# Nos quedamos con los vuelos que parten del Norte
+# para evitar el conteo duplicado de los vuelos
+# en caso de que haya vuelos que salen y entran 
+# a esta región. 
+datos_norte_2015 <- datos_2015 %>% 
+  filter(Region.Origen == "Norte")
+datos_norte_2019 <- datos_2019 %>% 
+  filter(Region.Origen=="Norte")
+```
+
+
+
+```{r figxNorte, fig.cap="Cantidad de vuelos por provincias (región Norte)"}
+cant_vxProv_2015 <-  datos_norte_2015 %>% 
+  group_by(Provincia.Origen) %>% 
+  count(sort=T) %>% 
+  mutate(anio = "2015" )
+
+cant_vxProv_2019 <-  datos_norte_2019 %>% 
+  group_by(Provincia.Origen) %>% 
+  count(sort=T) %>% 
+  mutate(anio = "2019" )
+
+cant_vxProv <- rbind(cant_vxProv_2015, cant_vxProv_2019)
+
+ggplot(cant_vxProv, aes(x=reorder(Provincia.Origen,-n), y=n, fill=anio)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_minimal() +
+  ylab("Cantidad de vuelos") +
+  xlab("") +
+  labs(fill = "año") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+```
+
+Como se observa en la figura \@ref(fig:figxNorte), vemos que en todas las provincias de esta región la cantidad de vuelos
+aumentaron. De estas provincias, es notable el aumento de la cantidad de vuelos en Corrientes. A continuación cuantificamos la diferencia como hicimos anteriormente. 
+```{r}
+t_2015 <- cant_vxProv_2015 %>% 
+  select(-c(anio)) %>% 
+  rename(vuelos_2015 = n)
+
+t_2019 <- cant_vxProv_2019 %>% 
+  select(-c(anio)) %>% 
+  rename(vuelos_2019 =n)
+
+t_dif_prov <- left_join(t_2015, t_2019, by="Provincia.Origen") %>% 
+  mutate(dif_porcentual = (vuelos_2019 - vuelos_2015)/vuelos_2015 * 100, 
+         dif_porcentual = round(dif_porcentual)) %>% 
+  arrange(desc(dif_porcentual)) 
+t_dif_prov
+```
+
+Tal como mostraba el gráfico, Corrientes tuvo un incremento cercano al 1000%, muy superior a las otras provincias de la región, aunque advertimos que la cantidad de vuelos de la provincia de Corrientes en el 2015 eran extremadamente bajos al comienzo de la serie de referencia. Creemos que esto se podría deber al hecho de que la capital de Corrientes es vecina a la ciudad de Resistencia, razón por la cual los aeropuertos podrían ser compartidos. Le sigue muy lejos, con un aumento cercano al 100%, Misiones y Santiago del Estero, seguido por Jujuy con el 86%. En el otro extremo, nos llama la atención que Formosa, con solo el 16%, estuvo muy por debajo de los aumentos observado en las otras provincias. 
+
+Cabe destacar que las provincias con mayor cantidad de vuelos en el 2015 y 2019 son Misiones y Salta, lo cual es lógico considerando que ambas son los mayores destinos turísticos nacionales de la región Norte.
+
+```{r echo=FALSE}
+summary(t_dif_prov$dif_porcentual)
+```
+Más específicamente, el 16% de Formosa dista de la mediana del 77%, en un 53%.  
+
+### Conectividad de las ciudades de la región Norte
+
+Luego de notar el aumento de los vuelos en esta región, cabe preguntarse si cambió la conectividad de las ciudades de la región norteña. Para estudiar esto, aprovechemos los grafos que armamos, a partir de los vuelos que entran y salen desde esta 
+región. El grafo, que en este caso es un grafo no dirigido, nos permite entender cómo se conectan estas ciudades con las del resto del país. Para esto, usaremos el grado de los nodos como proxy para entender la conexión interurbana. 
+
+```{r}
+datos_rutas_norte_2015 <- datos_2015 %>% 
+  filter(Region.Origen=="Norte" | Region.Destino=="Norte")
+
+edges_2015_norte <- datos_rutas_norte_2015 %>% 
+  select(Ciudad.Origen, Ciudad.Destino) %>% 
+  filter(Ciudad.Origen != Ciudad.Destino)  %>% 
+  group_by(Ciudad.Origen) %>% 
+  distinct() 
+
+datos_rutas_norte_2019 <- datos_2019 %>% 
+  filter(Region.Origen=="Norte" | Region.Destino == "Norte")
+
+edges_2019_norte <- datos_rutas_norte_2019 %>% 
+  select(Ciudad.Origen, Ciudad.Destino) %>% 
+  filter(Ciudad.Origen != Ciudad.Destino)  %>% 
+  group_by(Ciudad.Origen) %>% 
+  distinct() 
+
+```
+
+
+```{r fig.height=4, fig.width=6, warning=FALSE}
+# Construimos el grafo a partir de los nodos 
+# cada nodo es una ciudad y el vértice es un vuelo 
+# en el que llega o sale de una región del Norte
+g_2015 <- edges_2015_norte %>% 
+  graph_from_data_frame() %>% 
+  as_tbl_graph()
+
+g_2015 <- g_2015 %>% 
+  activate(nodes) %>% 
+  mutate(grado=degree(g_2015))
+
+p_2015 <- g_2015 %>% 
+  ggraph(layout = 'linear', circular=T) +
+  geom_edge_arc( edge_width=.5,alpha=0.4)+ 
+  geom_node_point(mapping = aes(color=name, size=grado), show.legend = F) +
+  ggtitle("2015")+
+  theme_graph() 
+
+p_2015 <- p_2015 + 
+  geom_node_text(aes(label = name), 
+                 nudge_x = p_2015$data$x * .2, 
+                 nudge_y = p_2015$data$y * .2,
+                 size=2) 
+
+g_2019 <- edges_2019_norte %>% 
+  graph_from_data_frame() %>% 
+  as_tbl_graph()
+
+g_2019 <- g_2019 %>% 
+  activate(nodes) %>% 
+  mutate(grado=degree(g_2019))
+
+p_2019 <- g_2019 %>% 
+  ggraph(layout = 'linear', circular=T) +
+  geom_edge_arc( edge_width=.5,alpha=0.4)+ 
+  geom_node_point(mapping = aes(color=name, size=grado), show.legend = F) +
+  ggtitle("2019")+
+  theme_graph() 
+
+ p_2019 <- p_2019 + geom_node_text(aes(label = name), 
+                 nudge_x = p_2015$data$x * .2, 
+                 nudge_y = p_2015$data$y * .2,
+                 size=2)
+ 
+ grid.arrange(p_2015, p_2019, ncol=2)
+```
+
+Al observar los grafos de conectividad, vemos que hubo un cambio en las conexiones. Nos interesaría explorar algunos nodos de manera interactiva, para eso dejamos el siguiente grafo interactivo correspondiente al año  2015: 
+
+```{r}
+simpleNetwork(edges_2015_norte, 
+              Source = "Ciudad.Origen", 
+              Target = "Ciudad.Destino",
+              linkDistance = 90,
+              fontSize = 10,
+              charge = -80,
+              nodeColour = "#F8766D",
+              zoom = F)
+```
+Y el siguiente que corresponde al 2019:
+```{r}
+simpleNetwork(edges_2019_norte, 
+              Source = "Ciudad.Origen", 
+              Target = "Ciudad.Destino", 
+              linkDistance = 90,
+              fontSize = 10,
+              nodeColour = "#619CFF",
+              charge = -70,
+              zoom = F)
+```
+De estos dos grafos, cabe destacar que la conectividad de Bariloche con las ciudades de esta región cayó en el 2019. Pero notamos cómo en este último año, Córdoba pasó a ser una de las ciudades más conectada a esta región. Eso también puede apreciarse en las siguientes tablas.
+
+```{r caption="2015"}
+tConectividad_2015 <- g_2015 %>%
+  activate(nodes) %>% 
+  as.data.frame() %>% 
+  arrange(desc(grado)) %>% 
+  rename("Ciudades 2015" =name) %>% 
+  head(10)
+tConectividad_2015
+```
+
+```{r caption="2019"}
+tConectividad_2019 <- g_2019 %>%
+  activate(nodes) %>% 
+  as.data.frame() %>% 
+  arrange(desc(grado)) %>% 
+  rename("Ciudades 2019" =name) %>% 
+  head(10) 
+tConectividad_2019
+```
+
+
+
+### Flujo de vuelos desde ciudades de la región Norte
+
+Al considerar las conexiones de vuelos interurbanas, nos gustaría ahora analizar cómo es el flujo aéreo entre esta región del país y las otras. Nos preguntamos entonces a qué destino van los vuelos que parten de las ciudades más conectadas del norte. Usamos para esto un diagrama Sankey: 
+  - del lado izquierdo, están aquellas ciudades del Norte mejor conectadas al país, desde estas salen los vuelos que consideramos;
+  - del lado derecho, están las ciudades a donde llegan los vuelos que salen de las localidades de la izquierda. 
+
+```{r}
+# Nos quedamos con los vuelos que salen del norte y son de
+# las 10 ciudades más conectadas de esta región.
+
+v_salida_norte_2015 <- datos_rutas_norte_2015 %>% 
+  filter(Region.Origen=="Norte",
+         Ciudad.Origen %in% tConectividad_2015$`Ciudades 2015`, 
+         Ciudad.Origen != Ciudad.Destino)
+v_salida_norte_2019 <- datos_rutas_norte_2019 %>% 
+  filter(Region.Origen=="Norte",
+         Ciudad.Origen %in% tConectividad_2019$`Ciudades 2019`, 
+         Ciudad.Origen != Ciudad.Destino)
+```
+
+
+```{r figSankey2015, fig.cap="Vuelos interurbanos del 2015"}
+# Armamos una matriz cuya columnas son los nodos "desde"
+# y las filas "hasta", luego relleno la matriz con el conteo 
+# de los vuelos 
+data <- table(v_salida_norte_2015$Ciudad.Origen, v_salida_norte_2015$Ciudad.Destino) %>% 
+  as.data.frame.matrix()
+
+# Armamos los vértices a partir de la matriz
+links <- data %>% 
+  rownames_to_column(var="source") %>% 
+  gather(key="target", value="value", -1) %>%
+  mutate(target = tolower(target)) %>% # renombramos los destinos
+  filter(value != 0)                   # a minúscula para evitar 
+                                       # conflictos en el gráf. 
+
+nodes <- data.frame(
+  name=c(as.character(links$source), as.character(links$target)) %>% 
+    unique()
+  )
+links$IDsource <- match(links$source, nodes$name)-1 
+links$IDtarget <- match(links$target, nodes$name)-1
+
+sankeyNetwork(Links = links, Nodes = nodes,
+              Source = "IDsource", 
+              Target = "IDtarget",
+              Value = "value", 
+              NodeID = "name", 
+              fontSize = 12, 
+              nodeWidth = 40)
+```
+_Nota:_ Para ver el número de vuelos de una ciudad a la otra, sugerimos mantener el cursor durante unos segundos sobre la banda deseada.
+
+
+
+```{r figSankey2019, fig.cap="Vuelos interurbanos del 2019"}
+data <- table(v_salida_norte_2019$Ciudad.Origen, v_salida_norte_2019$Ciudad.Destino) %>% 
+  as.data.frame.matrix()
+
+links <- data %>% 
+  rownames_to_column(var="source") %>% 
+  gather(key="target", value="value", -1) %>% 
+  mutate(target = tolower(target)) %>% 
+  filter(value != 0)
+
+nodes <- data.frame(
+  name=c(as.character(links$source), as.character(links$target)) %>% 
+    unique()
+  )
+links$IDsource <- match(links$source, nodes$name)-1 
+links$IDtarget <- match(links$target, nodes$name)-1
+
+sankeyNetwork(Links = links, Nodes = nodes,
+              Source = "IDsource", 
+              Target = "IDtarget",
+              Value = "value", 
+              NodeID = "name", 
+              fontSize = 12, 
+              nodeWidth = 40)
+```
+
+
+
+## Aerolíneas más voladas a nivel nacional en 2015 y 2019
+
+Pasemos a continuación a un análisis de las empresas que protagonizaron estos cambios. Para eso, nos centraremos en las 5 aerolíneas más importante en los respectivos años, nos preguntamos si son las mismas, o si por el contrario irrumpieron nuevos actores en el escenario aerocomercial de nuestro país. Pensamos que en esta nueva escena, tomarán protagonismo las empresas low-cost como Flybondi, Norwegian, entre otras. 
+
+
+```{r}
+# Cantidad de vuelos por aerolíneas
+cant_vxAerolineas_2015 <- datos_2015 %>% 
+  group_by(Aerolinea.Nombre) %>% 
+  count(sort = T)
+
+# Seleccionamos las 5 más importantes
+filtro_top_5_2015 <- cant_vxAerolineas_2015$Aerolinea.Nombre[1:5]
+
+datos_top5_2015 <- datos_2015 %>% 
+  filter(Aerolinea.Nombre %in% filtro_top_5_2015) 
+
+# Ídem 2019
+cant_vxAerolineas_2019 <- datos_2019 %>% 
+  group_by(Aerolinea.Nombre) %>% 
+  count(sort = T)
+
+filtro_top_5_2019 <- cant_vxAerolineas_2019$Aerolinea.Nombre[1:5]
+
+datos_top5_2019 <- datos_2019 %>% 
+  filter(Aerolinea.Nombre %in% filtro_top_5_2019) 
+
+```
+
+
+```{r figTopAerolineas, fig.cap="Top 5 serolíneas más voladas en Argentina en el 2015 y 2019"}
+rbind(datos_top5_2015 %>% mutate(anio=2015), datos_top5_2019 %>% mutate(anio=2019)) %>% 
+  ggplot() +
+  geom_mosaic(aes(x = product(Aerolinea.Nombre, anio), fill=Aerolinea.Nombre)) +
+  theme(axis.text.y = element_blank(), axis.ticks = element_blank()) +
+  scale_fill_brewer(palette="Set2") +
+  ylab("")
+```
+**Análisis cuantitativo** 
+
+
+**2015**
+```{r}
+
+tParticipacion_top5_2015 <- datos_top5_2015 %>% 
+  group_by(Aerolinea.Nombre) %>% 
+  summarise(n = n()) %>% 
+  mutate(freq = round(n /sum(n),4), freq = freq*100) %>% 
+  arrange(desc(freq)) %>%  
+  select(Aerolinea.Nombre, freq) %>% 
+  rename(participacion = freq )
+
+tParticipacion_top5_2015 
+```
+
+
+**2019**
+```{r}
+tParticipacion_top5_2019 <- datos_top5_2019 %>% 
+  group_by(Aerolinea.Nombre) %>% 
+  summarise(n = n()) %>% 
+  mutate(freq = round(n /sum(n),4), freq = freq*100) %>% 
+  arrange(desc(freq)) %>%  
+  select(Aerolinea.Nombre, freq) %>% 
+  rename(participacion = freq )
+
+tParticipacion_top5_2019
+```
+
+
+La primera observación que podemos realizar es que mientras Aerolíneas Argentinas y Austral permanecen como líderes del mercado acumulando, entre ambas, ocupan aproximadamente el 75% de los vuelos y LATAM conserva el tercer puesto, aún con una leve disminución en su participación del 19% al 13%. Lo mayores cambios se dan en el cuarto y el quinto lugar, ya que irrumpen dos empresas de las llamadas "low-cost", Flybondi y Norwegian, y pierden terreno Andes y SOL líneas aéreas. El segundo aspecto que llama la atención es que durante el periodo analizado, la participación conjunta del mercado de Aerolíneas y Austral permanecen sin cambios. 
+
+Al observar el cambio de las aerolíneas estatales, notamos que la empresa Austral aumenta su participación relativa en el mercado respecto a Aerolíneas. Es notorio que, el surgimiento de las empresas low-cost mencionadas anteriormente se da en detrimento de la participación en el mercado de LATAM y la desaparición en los lugares principales de Andes y SOL. 
+
+Retomando nuestra inquietud sobre la región Norte de nuestro país, en esta parte realizaremos el mismo análisis pero más enfocado en esta región.  
+
+```{r figMosaic2, fig.cap="Top 5 serolíneas más voladas en la región Norte en el 2015 y 2019."}
+datos_top5Norte_2015 <-  datos_top5_2015 %>% 
+  filter(Region.Origen=="Norte" | Region.Destino=="Norte") %>% 
+  select(Aerolinea.Nombre) %>% 
+  mutate(anio=2015)
+
+datos_top5Norte_2019 <- datos_top5_2019 %>% 
+  filter(Region.Origen=="Norte" | Region.Destino=="Norte") %>% 
+  select(Aerolinea.Nombre) %>% 
+  mutate(anio=2019) 
+  
+df_vuelosAerolineas <- rbind(datos_top5Norte_2015 , datos_top5Norte_2019) 
+
+df_vuelosAerolineas %>% 
+  ggplot() +
+  geom_mosaic(aes(x = product(Aerolinea.Nombre, anio), fill=Aerolinea.Nombre)) +
+  ylab("") +
+  xlab("Año") +
+  theme(axis.text.y = element_blank(), axis.ticks = element_blank()) 
+```
+
+**2015**
+```{r }
+
+tParticipacion_Norte_2015 <- datos_top5Norte_2015 %>% 
+  group_by(Aerolinea.Nombre) %>% 
+  summarise(n = n()) %>% 
+  mutate(freq = round(n /sum(n),4), freq = freq*100) %>% 
+  arrange(desc(freq)) %>%  
+  select(Aerolinea.Nombre, freq) %>% 
+  rename(participacion = freq )
+
+tParticipacion_Norte_2015
+```
+
+**2019**
+```{r}
+tParticipacion_Norte_2019 <- datos_top5Norte_2019 %>% 
+  group_by(Aerolinea.Nombre) %>% 
+  summarise(n = n()) %>% 
+  mutate(freq = round(n /sum(n),4), freq = freq*100) %>% 
+  arrange(desc(freq)) %>%  
+  select(Aerolinea.Nombre, freq) %>% 
+  rename(participacion = freq )
+
+tParticipacion_Norte_2019
+```
+
+Se advierte claramente en este último gráfico que el aumento de la región Norte no se explica por la empresa LATAM sino que se debe al aumento en la cantidad de vuelos de Aerolíneas/Austral y en mayor medida por el aporte que realizan las nuevas empresas low-cost. 
+
+
+## Reflexiones finales
+ A nivel general, podemos corroborar nuestra hipótesis de que hubo importantes cambios en el mapa aerocomercial argentino, que se visibilizan en una mayor diversificación de la oferta de rutas como de empresas nuevas. Un ejemplo de esta circunstancia es la región del Norte argentino, que pese a ser la región más desfavorecida económicamente tuvo un importante cambio. 
+ Quizás lo más destacable de este crecimiento en los vuelos, es que se dieron en un contexto de poco crecimiento económico en el país. 
+
+
+
+
